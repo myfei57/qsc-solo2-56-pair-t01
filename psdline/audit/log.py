@@ -21,6 +21,7 @@ class AuditLog:
         self._journal = journal
         self._ids = IdFactory("audit")
         self._index: list[AuditEntry] = []
+        self._restore()
 
     @property
     def journal(self) -> JsonlJournal:
@@ -68,6 +69,13 @@ class AuditLog:
         """返回内存里保留的审计条目。"""
 
         return list(self._index)
+
+    def _restore(self) -> None:
+        """从只追加流水恢复内存索引，重启后的通用审计视图不丢历史。"""
+
+        self._index = self.replay()
+        for _entry in self._index:
+            self._ids.next()
 
     def replay(self, limit: int = 100_000) -> list[AuditEntry]:
         """从落盘流水回放审计条目。"""

@@ -32,5 +32,8 @@ def online(platform) -> Platform:
 
     platform.start()
     platform.arrive("T01", "ST1", 0)
+    for zone in platform.clearance_view("T01", "ST1")["zones"]:
+        platform.confirm_clearance_zone("T01", "ST1", zone["id"], "fixture-staff")
+    platform.complete_clearance("T01", "ST1", "fixture-dispatcher")
     platform.check_gap("T01")
     return platform

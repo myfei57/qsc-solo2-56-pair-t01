@@ -73,6 +73,12 @@ def _cmd_demo(args: argparse.Namespace) -> int:
     arrival = platform.arrive(args.train, args.station, 0)
     position = platform.refresh_position(args.train, 12)
     gap = platform.check_gap(args.train)
+    clearance_zones = platform.station_view(args.station)["order"]
+    clearance_confirms = [
+        platform.confirm_clearance_zone(args.train, args.station, zone, "demo-operator")
+        for zone in clearance_zones
+    ]
+    clearance = platform.complete_clearance(args.train, args.station, "demo-supervisor")
     queued = platform.enqueue(args.train, "cmd-1", "open", args.station)
     processed = platform.process_queue(args.train)
     swept = platform.sweep(args.station)
@@ -99,6 +105,11 @@ def _cmd_demo(args: argparse.Namespace) -> int:
         "arrival": {key: arrival[key] for key in ("ok", "position_m", "violations")},
         "position": position,
         "gap": gap,
+        "clearance": {
+            "zones": clearance_zones,
+            "confirmed": len(clearance_confirms),
+            "verdict_id": clearance.get("verdict_id", ""),
+        },
         "queued": {key: queued[key] for key in ("ok", "train_id")},
         "processed": processed,
         "swept": swept,
@@ -123,6 +134,7 @@ def _cmd_demo(args: argparse.Namespace) -> int:
         ("arrival", arrival),
         ("processed", processed),
         ("renumber", renumber),
+        ("clearance", clearance),
         ("cleared", cleared),
         ("sequence", sequence),
         ("departure", departure),

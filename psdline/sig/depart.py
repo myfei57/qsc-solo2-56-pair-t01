@@ -1,17 +1,22 @@
 """发车放行。
 
-发车前必须同时满足两个条件：间隙探测已确认，且关门记录已落盘。两个条件缺一
-不放行，放行失败时返回具体是哪一条没满足，便于值班员判断该去复检探测还是去
-复检门控。
+发车前必须同时满足三个条件：清客结论已收口、间隙探测已确认、关门记录已
+落盘。清客结论从清客事件注册表读取，门控不缓存第二份“已清客”状态；任何一条
+不满足都不放行，并返回具体原因，便于值班员判断该去复检哪一处。
 """
 
 from __future__ import annotations
 
 import json
 
+from typing import TYPE_CHECKING
+
 from ..gap import GapRegistry
 from ..store import JsonStore
 from .sig import SignalController
+
+if TYPE_CHECKING:
+    from ..clearance import ClearanceRegistry
 
 
 def close_doc_id(train_id: str) -> str:
@@ -36,11 +41,22 @@ def depart_checked(
     signals: SignalController,
     store: JsonStore,
     gaps: GapRegistry,
+    clearances: "ClearanceRegistry",
     train_id: str,
+    station_id: str,
     at: float,
+    release_request_id: str = "",
 ) -> dict:
-    """按顺序核对间隙确认与关门落盘，然后升起发车信号。"""
+    """核对清客结论、间隙确认与关门落盘；升灯由发车临界区完成。"""
 
+    raw_clearance = clearances.verdict(train_id, station_id, at, release_request_id)
+    if not raw_clearance["ok"]:
+        return {
+            "ok": False,
+            "reason": raw_clearance.get("reason", "clearance_not_cleared"),
+            "train_id": train_id,
+            "violations": list(raw_clearance["violations"]),
+        }
     if not gaps.clear(train_id):
         return {
             "ok": False,
@@ -55,5 +71,10 @@ def depart_checked(
             "train_id": train_id,
             "violations": ["关门未落盘"],
         }
-    signals.raise_signal(train_id, "depart", at)
-    return {"ok": True, "train_id": train_id, "aspect": "green", "violations": []}
+    return {
+        "ok": True,
+        "train_id": train_id,
+        "clearance_verdict_id": raw_clearance.get("verdict_id", ""),
+        "aspect": "green",
+        "violations": [],
+    }

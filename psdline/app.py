@@ -4,13 +4,16 @@
 探测、配额与审计按真实调用链装到一起，并暴露四件事：到发编排（到站、发车、
 门区联动、批量开门、清扫）、控制循环、状态快照与手动检修动作。
 
-控制链固定为「信号 → 停稳对位 → 开门 → 间隙探测 → 关门 → 发车 → 审计」，
+控制链固定为「信号 → 停稳对位 → 开门 → 门区清客 → 间隙探测 → 关门 → 发车 → 审计」，
 任何一步错位都会被对应组件拒绝，并把拒绝原因落进审计。
 """
 
 from __future__ import annotations
 
+import threading
+
 from .audit import AuditLog, build_timeline
+from .clearance import ClearanceRegistry, ClearanceService
 from .clock import Clock, SystemClock
 from .config import PlatformConfig, default_config, with_storage_root
 from .door import (
@@ -100,6 +103,16 @@ class Platform:
             self.bus,
             JsonlJournal(store.root, "audit", segment_limit=self.config.audit.journal_segment),
         )
+        self.clearances = ClearanceRegistry(
+            JsonlJournal(
+                store.root,
+                "clearance",
+                segment_limit=self.config.clearance.journal_segment,
+            ),
+            zone_ttl_s=self.config.clearance.zone_ttl_s,
+        )
+        self.clearance_service = ClearanceService(self.clearances, self.audit, self.clock)
+        self._control_lock = threading.RLock()
         self.namespace = Namespace(
             self.config.namespace.line, list(self.config.namespace.stations)
         )
@@ -220,6 +233,7 @@ class Platform:
             self._operations = int(state.get("operations", 0))
             self._cycles = int(state.get("cycles", 0))
         restore_lockouts(self.faults, self.gates, self.lockouts, not self.gaps.blocked_ids())
+        self.clearance_service.recover_pending_releases(self.signals, self.doors)
 
     def _persist(self) -> None:
         """落盘平台计数，供重启后对照。"""
@@ -287,6 +301,7 @@ class Platform:
             op_id=op_id,
             ok=bool(report.get("ok")),
             violations=list(report.get("violations", [])),
+            clearance_verdict_id=report.get("clearance_verdict_id") or None,
         )
         return {
             "op_id": op_id,
@@ -404,11 +419,23 @@ class Platform:
                 "detail": {"train_id": train_id, "position_m": alignment.position_m},
             }
         )
+        layout = self.layouts.get(station_id)
+        zone_ids = [zone.id for zone in layout.zones] if layout else []
         try:
+            clearance_start = self.clearance_service.begin(
+                train_id, station_id, zone_ids, operator="arrival"
+            )
             self.doors_open(train_id, station_id)
         except RailError as error:
             return reject(error.message)
-        entry = self.audit.record(ARRIVAL, train_id, station_id, position_m=position_m)
+        entry = self.audit.record(
+            ARRIVAL,
+            train_id,
+            station_id,
+            position_m=position_m,
+            clearance_event_id=clearance_start["event_id"],
+            clearance_attempt=clearance_start["attempt"],
+        )
         report = {
             "ok": True,
             "train_id": train_id,
@@ -444,7 +471,13 @@ class Platform:
         return {**report, "group": group}
 
     def depart(self, train_id: str, station_id: str) -> dict:
-        """关门到发车：关门指令 → 间隙探测 → 关门落盘 → 发车信号。"""
+        """串行化发车临界区，避免重复请求在关门/升灯之间穿透。"""
+
+        with self._control_lock:
+            return self._depart_locked(train_id, station_id)
+
+    def _depart_locked(self, train_id: str, station_id: str) -> dict:
+        """关门到发车：清客结论 → 间隙探测 → 关门落盘 → 发车信号。"""
 
         op_id = self.ids.labeled("depart")
         steps: list[dict] = []
@@ -460,6 +493,49 @@ class Platform:
             return {**report, **summary}
 
         gate = self._primary_gate(station_id)
+        train = self.trains.get(train_id)
+        if train is not None and train.station and train.station != station_id:
+            report = {
+                "ok": False,
+                "train_id": train_id,
+                "station_id": station_id,
+                "steps": steps,
+                "violations": [f"列车当前停在 {train.station}，不能按 {station_id} 发车"],
+            }
+            summary = self._record_operation(op_id, "depart", report)
+            return {**report, **summary}
+        clearance = self.clearance_service.verdict(train_id, station_id)
+        if not clearance["ok"]:
+            report = {
+                "ok": False,
+                "train_id": train_id,
+                "station_id": station_id,
+                "steps": steps,
+                "violations": list(clearance["violations"]),
+            }
+            summary = self._record_operation(op_id, "depart", report)
+            return {**report, **summary}
+        try:
+            release = self.clearance_service.prepare_release(
+                train_id, station_id, request_id=op_id
+            )
+        except RailError as error:
+            report = {
+                "ok": False,
+                "train_id": train_id,
+                "station_id": station_id,
+                "steps": steps,
+                "violations": [error.message],
+            }
+            summary = self._record_operation(op_id, "depart", report)
+            return {**report, **summary}
+        steps.append(
+            {
+                "component": "clearance",
+                "action": "release_prepared",
+                "detail": {"verdict_id": clearance.get("verdict_id", ""), "attempt": release["attempt"]},
+            }
+        )
         if gate is not None and not self.lockouts.is_locked(gate.id):
             self.lockouts.set(gate.id, True)
             steps.append(
@@ -470,6 +546,7 @@ class Platform:
                 self.doors, self.audit, train_id, station_id, DEPART, self.clock.now()
             )
         except RailError as error:
+            self.clearance_service.abort_release(train_id, station_id, "close_failed")
             report = {
                 "ok": False,
                 "train_id": train_id,
@@ -490,8 +567,20 @@ class Platform:
                 "detail": {"train_id": train_id, "state": gap_state},
             }
         )
-        verdict = depart_checked(self.signals, self.store, self.gaps, train_id, self.clock.now())
+        verdict = depart_checked(
+            self.signals,
+            self.store,
+            self.gaps,
+            self.clearances,
+            train_id,
+            station_id,
+            self.clock.now(),
+            release_request_id=op_id,
+        )
         if not verdict["ok"]:
+            self.clearance_service.abort_release(
+                train_id, station_id, "depart_verdict_failed"
+            )
             report = {
                 "ok": False,
                 "train_id": train_id,
@@ -501,10 +590,19 @@ class Platform:
             }
             summary = self._record_operation(op_id, "depart", report)
             return {**report, **summary}
+        self.signals.raise_signal(train_id, DEPART, self.clock.now())
         steps.append(
             {"component": "sig", "action": "depart_signal", "detail": {"train_id": train_id}}
         )
         departure = depart(self.doors, train_id, self.clock.now())
+        released = self.clearance_service.finish_release(train_id, station_id)
+        steps.append(
+            {
+                "component": "clearance",
+                "action": "release_finished",
+                "detail": {"event_id": released["event_id"]},
+            }
+        )
         if gate is not None:
             self.lockouts.clear(gate.id)
         report = {
@@ -513,6 +611,7 @@ class Platform:
             "station_id": station_id,
             "close_durable": bool(closed["close_durable"]),
             "aspect": verdict["aspect"],
+            "clearance_verdict_id": clearance.get("verdict_id", ""),
             "cleared_commands": departure["cleared_commands"],
             "steps": steps,
             "violations": [],
@@ -531,6 +630,83 @@ class Platform:
             result = self.gaps.probe(train_id, False, self.clock.now())
         self.audit.record("gap_probe", train_id, "", clear=clear)
         return {"ok": True, "train_id": train_id, "clear": result.clear, "violations": []}
+
+    def clearance_view(self, train_id: str, station_id: str) -> dict:
+        """读取一个站台清客轮次的当前视图。"""
+
+        return self.clearance_service.view(train_id, station_id)
+
+    def clearance_verdict(self, train_id: str, station_id: str) -> dict:
+        """读取门控与联锁共用的清客结论。"""
+
+        return self.clearance_service.verdict(train_id, station_id)
+
+    def confirm_clearance_zone(
+        self,
+        train_id: str,
+        station_id: str,
+        zone_id: str,
+        operator: str,
+        request_id: str = "",
+    ) -> dict:
+        """确认单个门区；门区之间不强制先后顺序。"""
+
+        return self.clearance_service.confirm(
+            train_id, station_id, zone_id, operator, request_id
+        )
+
+    def complete_clearance(
+        self,
+        train_id: str,
+        station_id: str,
+        operator: str,
+        request_id: str = "",
+        expected_revision: int | None = None,
+    ) -> dict:
+        """所有门区确认后统一收口，生成唯一发车结论。"""
+
+        return self.clearance_service.complete(
+            train_id,
+            station_id,
+            operator,
+            request_id=request_id,
+            expected_revision=expected_revision,
+        )
+
+    def suspend_clearance(
+        self,
+        train_id: str,
+        station_id: str,
+        reason: str,
+        operator: str = "platform-intrusion",
+        request_id: str = "",
+    ) -> dict:
+        """有人闯回站台时挂起本轮清客并撤销当前确认结论。"""
+
+        return self.clearance_service.suspend(
+            train_id, station_id, reason, operator=operator, request_id=request_id
+        )
+
+    def resume_clearance(
+        self,
+        train_id: str,
+        station_id: str,
+        operator: str,
+        request_id: str = "",
+    ) -> dict:
+        """挂起事件处置完成后恢复，门区需重新确认。"""
+
+        return self.clearance_service.resume(train_id, station_id, operator, request_id)
+
+    def clearance_history(
+        self, train_id: str = "", station_id: str = "", limit: int | None = None
+    ) -> dict:
+        """读取不可变清客事件历史。"""
+
+        return {
+            "events": self.clearance_service.history(train_id, station_id, limit=limit),
+            "violations": [],
+        }
 
     def renumber(self, station_id: str, groups: dict[str, str]) -> dict:
         """按最新布局重排门区映射，并按新映射联动一次。"""
@@ -742,6 +918,7 @@ class Platform:
                 self.faults, self.gates, self.config.interlock.max_locked_ratio
             ),
             "gaps": gap_summary(self.gaps, ids),
+            "clearance": self.clearance_service.summary(),
             "quota": {
                 ARRIVAL: self.quotas.status(ARRIVAL),
                 DEPART: self.quotas.status(DEPART),
@@ -779,12 +956,15 @@ class Platform:
     def train_view(self, train_id: str) -> dict:
         """返回一列车的综合视图。"""
 
+        at = self.clock.now()
+        clearance = self.clearances.latest_for_train(train_id, at)
         return {
             "train": self.trains.get(train_id).as_dict() if self.trains.get(train_id) else None,
             "state": train_state(train_id, self.align, self.train_doors, self.positions),
             "doors": door_state(self.doors, train_id),
             "aspect": aspect_of(self.signals, train_id),
             "gap": self.gaps.state(train_id),
+            "clearance": clearance.as_dict(at) if clearance else None,
         }
 
     def station_view(self, station_id: str) -> dict:

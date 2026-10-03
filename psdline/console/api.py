@@ -66,6 +66,9 @@ class Api:
         add("GET", "/api/doors/{psdID}", self._gate)
         add("GET", "/api/interlock", lambda params, body: self._platform.status()["interlock"])
         add("GET", "/api/gaps", lambda params, body: self._platform.status()["gaps"])
+        add("GET", "/api/clearance", self._clearance_view)
+        add("GET", "/api/clearance/verdict", self._clearance_verdict)
+        add("GET", "/api/clearance/history", self._clearance_history)
         add("GET", "/api/quota", lambda params, body: self._platform.status()["quota"])
         add("GET", "/api/audit", self._audit)
         add("GET", "/api/timeline", self._timeline)
@@ -77,6 +80,10 @@ class Api:
         add("POST", "/api/arrive", self._arrive)
         add("POST", "/api/depart", self._depart)
         add("POST", "/api/gap", self._gap)
+        add("POST", "/api/clearance/confirm", self._clearance_confirm)
+        add("POST", "/api/clearance/complete", self._clearance_complete)
+        add("POST", "/api/clearance/suspend", self._clearance_suspend)
+        add("POST", "/api/clearance/resume", self._clearance_resume)
         add("POST", "/api/enqueue", self._enqueue)
         add("POST", "/api/process", self._process)
         add("POST", "/api/renumber", self._renumber)
@@ -199,6 +206,60 @@ class Api:
 
     def _gap(self, params: dict, body: dict) -> dict:
         return self._platform.check_gap(_require(body, "train_id"), bool(body.get("clear", True)))
+
+    def _clearance_view(self, params: dict, body: dict) -> dict:
+        return self._platform.clearance_view(
+            str(params.get("train_id", "")), str(params.get("station_id", ""))
+        )
+
+    def _clearance_verdict(self, params: dict, body: dict) -> dict:
+        return self._platform.clearance_verdict(
+            str(params.get("train_id", "")), str(params.get("station_id", ""))
+        )
+
+    def _clearance_history(self, params: dict, body: dict) -> dict:
+        limit = params.get("limit")
+        return self._platform.clearance_history(
+            str(params.get("train_id", "")),
+            str(params.get("station_id", "")),
+            limit=int(limit) if limit not in (None, "") else None,
+        )
+
+    def _clearance_confirm(self, params: dict, body: dict) -> dict:
+        return self._platform.confirm_clearance_zone(
+            _require(body, "train_id"),
+            _require(body, "station_id"),
+            _require(body, "zone_id"),
+            _require(body, "operator"),
+            str(body.get("request_id", "")),
+        )
+
+    def _clearance_complete(self, params: dict, body: dict) -> dict:
+        raw_revision = body.get("expected_revision")
+        return self._platform.complete_clearance(
+            _require(body, "train_id"),
+            _require(body, "station_id"),
+            _require(body, "operator"),
+            str(body.get("request_id", "")),
+            int(raw_revision) if raw_revision is not None else None,
+        )
+
+    def _clearance_suspend(self, params: dict, body: dict) -> dict:
+        return self._platform.suspend_clearance(
+            _require(body, "train_id"),
+            _require(body, "station_id"),
+            _require(body, "reason"),
+            str(body.get("operator", "platform-intrusion")),
+            str(body.get("request_id", "")),
+        )
+
+    def _clearance_resume(self, params: dict, body: dict) -> dict:
+        return self._platform.resume_clearance(
+            _require(body, "train_id"),
+            _require(body, "station_id"),
+            _require(body, "operator"),
+            str(body.get("request_id", "")),
+        )
 
     def _enqueue(self, params: dict, body: dict) -> dict:
         return self._platform.enqueue(

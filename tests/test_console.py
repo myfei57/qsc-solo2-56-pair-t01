@@ -28,6 +28,8 @@ def test_api_returns_status_and_routes(platform):
     assert payload["platform"] == platform.config.name
     paths = [route["path"] for route in api.routes()]
     assert "/api/arrive" in paths
+    assert "/api/clearance/confirm" in paths
+    assert "/api/clearance/verdict" in paths
     assert "/api/trains/{trainID}" in paths
 
 
@@ -72,6 +74,29 @@ def test_api_action_flow(platform):
     assert status == 200 and arrival["ok"] is True
     status, gap = api.handle("POST", "/api/gap", {}, {"train_id": "T01"})
     assert status == 200 and gap["clear"] is True
+    status, view = api.handle("GET", "/api/clearance", {"train_id": "T01", "station_id": "ST1"}, {})
+    assert status == 200 and view["total_zones"] == 4
+    for zone in view["zones"]:
+        status, confirmed = api.handle(
+            "POST",
+            "/api/clearance/confirm",
+            {},
+            {
+                "train_id": "T01",
+                "station_id": "ST1",
+                "zone_id": zone["id"],
+                "operator": "staff",
+                "request_id": f"req-{zone['id']}",
+            },
+        )
+        assert status == 200 and confirmed["ok"] is True
+    status, cleared = api.handle(
+        "POST",
+        "/api/clearance/complete",
+        {},
+        {"train_id": "T01", "station_id": "ST1", "operator": "dispatcher", "request_id": "complete-1"},
+    )
+    assert status == 200 and cleared["status"] == "cleared"
     status, queued = api.handle(
         "POST", "/api/enqueue", {}, {"train_id": "T01", "id": "c1", "kind": "open", "station_id": "ST1"}
     )

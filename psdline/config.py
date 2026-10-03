@@ -71,6 +71,14 @@ class GapSection:
 
 
 @dataclass(frozen=True)
+class ClearanceSection:
+    """站台清客确认限值。"""
+
+    zone_ttl_s: float = 120.0
+    journal_segment: int = 512
+
+
+@dataclass(frozen=True)
 class SignalSection:
     """信号刷新限值。"""
 
@@ -120,6 +128,7 @@ class PlatformConfig:
     train: TrainSection = field(default_factory=TrainSection)
     door: DoorSection = field(default_factory=DoorSection)
     gap: GapSection = field(default_factory=GapSection)
+    clearance: ClearanceSection = field(default_factory=ClearanceSection)
     signal: SignalSection = field(default_factory=SignalSection)
     interlock: InterlockSection = field(default_factory=InterlockSection)
     quota: QuotaSection = field(default_factory=QuotaSection)
@@ -159,6 +168,10 @@ class PlatformConfig:
             raise ConfigError("批量开门上限必须为正", component="config")
         if self.gap.min_clearance_mm < 0:
             raise ConfigError("最小间隙不能为负", component="config")
+        if self.clearance.zone_ttl_s <= 0:
+            raise ConfigError("门区确认有效期必须为正", component="config")
+        if self.clearance.journal_segment <= 0:
+            raise ConfigError("清客审计分段长度必须为正", component="config")
         if self.signal.stale_after_s <= 0:
             raise ConfigError("位置过期时间必须为正", component="config")
         if self.signal.sequence_modulus != 65536:
@@ -209,6 +222,7 @@ def config_to_mapping(config: PlatformConfig) -> dict:
         "train": dict(config.train.__dict__),
         "door": dict(config.door.__dict__),
         "gap": dict(config.gap.__dict__),
+        "clearance": dict(config.clearance.__dict__),
         "signal": dict(config.signal.__dict__),
         "interlock": dict(config.interlock.__dict__),
         "quota": dict(config.quota.__dict__),
@@ -229,6 +243,7 @@ def config_from_mapping(payload: dict) -> PlatformConfig:
         train=_section(TrainSection, payload.get("train")),
         door=_section(DoorSection, payload.get("door")),
         gap=_section(GapSection, payload.get("gap")),
+        clearance=_section(ClearanceSection, payload.get("clearance")),
         signal=_section(SignalSection, payload.get("signal")),
         interlock=_section(InterlockSection, payload.get("interlock")),
         quota=_section(QuotaSection, payload.get("quota")),

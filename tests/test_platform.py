@@ -22,10 +22,16 @@ def test_arrive_then_depart_full_chain(platform):
     assert platform.train_doors.is_open("T01") is True
     gap = platform.check_gap("T01")
     assert gap["ok"] is True
+    assert platform.depart("T01", "ST1")["violations"] == ["清客门区未全部确认"]
+    zones = platform.clearance_view("T01", "ST1")["zones"]
+    for zone in zones:
+        platform.confirm_clearance_zone("T01", "ST1", zone["id"], "staff")
+    cleared = platform.complete_clearance("T01", "ST1", "dispatcher")
     departure = platform.depart("T01", "ST1")
     assert departure["ok"] is True
     assert departure["close_durable"] is True
     assert departure["aspect"] == "green"
+    assert departure["clearance_verdict_id"] == cleared["verdict_id"]
     assert departed(platform.doors, "T01") is True
 
 
@@ -40,6 +46,9 @@ def test_arrive_rejects_out_of_tolerance_and_unknown_station(platform):
 
 def test_depart_blocked_by_blocked_gap(platform):
     platform.arrive("T01", "ST1", 0)
+    for zone in platform.clearance_view("T01", "ST1")["zones"]:
+        platform.confirm_clearance_zone("T01", "ST1", zone["id"], "staff")
+    platform.complete_clearance("T01", "ST1", "dispatcher")
     platform.check_gap("T01", clear=False)
     departure = platform.depart("T01", "ST1")
     assert departure["ok"] is False
@@ -110,6 +119,9 @@ def test_process_queue_requires_depart_policy(platform):
     assert blocked["ready"] is False
     assert "close_durable" in blocked["violations"]
     platform.check_gap("T01")
+    for zone in platform.clearance_view("T01", "ST1")["zones"]:
+        platform.confirm_clearance_zone("T01", "ST1", zone["id"], "staff")
+    platform.complete_clearance("T01", "ST1", "dispatcher")
     platform.depart("T01", "ST1")
     allowed = platform.process_queue("T01")
     assert allowed["ready"] is True
@@ -128,6 +140,7 @@ def test_status_and_snapshot_cover_every_component(platform):
         "signals",
         "interlock",
         "gaps",
+        "clearance",
         "quota",
         "store",
         "audit",

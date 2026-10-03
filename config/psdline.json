@@ -31,6 +31,10 @@
     "probe_timeout_s": 20.0,
     "min_clearance_mm": 12.0
   },
+  "clearance": {
+    "zone_ttl_s": 120.0,
+    "journal_segment": 512
+  },
   "signal": {
     "refresh_period_s": 1.0,
     "stale_after_s": 8.0,
