@@ -78,6 +78,21 @@ def test_api_action_flow(platform):
     assert status == 200
     status, processed = api.handle("POST", "/api/process", {}, {"train_id": "T01"})
     assert status == 200 and processed["ids"] == ["c1"] and processed["ready"] is False
+    # 发车前逐门区清客确认并收口
+    status, session = api.handle("GET", "/api/clearing/T01", {}, {})
+    assert status == 200
+    for zone_id in session["zone_order"]:
+        status, _ = api.handle(
+            "POST",
+            "/api/clearing/T01/confirm",
+            {},
+            {"zone_id": zone_id, "request_id": f"api-{zone_id}"},
+        )
+        assert status == 200
+    status, finalized = api.handle(
+        "POST", "/api/clearing/T01/finalize", {}, {"request_id": "api-finalize"}
+    )
+    assert status == 200 and finalized["verdict"]["decision"] == "go"
     status, departure = api.handle(
         "POST", "/api/depart", {}, {"train_id": "T01", "station_id": "ST1"}
     )

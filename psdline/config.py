@@ -103,6 +103,18 @@ class AuditSection:
 
 
 @dataclass(frozen=True)
+class ClearingSection:
+    """清客确认限值。
+
+    ``confirm_ttl_s`` 是单块确认的有效期：preserve 策略下超过它确认在收口时软
+    失效（记录保留），reset 策略下停站超过它整单代际加一、全部重来。
+    """
+
+    confirm_ttl_s: float = 120.0
+    timeout_policy: str = "preserve"
+
+
+@dataclass(frozen=True)
 class ConsoleSection:
     """控制台监听地址。"""
 
@@ -124,6 +136,7 @@ class PlatformConfig:
     interlock: InterlockSection = field(default_factory=InterlockSection)
     quota: QuotaSection = field(default_factory=QuotaSection)
     audit: AuditSection = field(default_factory=AuditSection)
+    clearing: ClearingSection = field(default_factory=ClearingSection)
     console: ConsoleSection = field(default_factory=ConsoleSection)
 
     @property
@@ -169,6 +182,10 @@ class PlatformConfig:
             raise ConfigError("运行配额必须为正", component="config")
         if self.audit.journal_segment <= 0:
             raise ConfigError("审计分段长度必须为正", component="config")
+        if self.clearing.confirm_ttl_s <= 0:
+            raise ConfigError("清客确认有效期必须为正", component="config")
+        if self.clearing.timeout_policy not in ("preserve", "reset"):
+            raise ConfigError("清客超时策略必须是 preserve 或 reset", component="config")
         if not 0 < self.console.port <= 65535:
             raise ConfigError("控制台端口必须落在 1..65535", component="config")
         return self
@@ -213,6 +230,7 @@ def config_to_mapping(config: PlatformConfig) -> dict:
         "interlock": dict(config.interlock.__dict__),
         "quota": dict(config.quota.__dict__),
         "audit": dict(config.audit.__dict__),
+        "clearing": dict(config.clearing.__dict__),
         "console": dict(config.console.__dict__),
     }
 
@@ -233,6 +251,7 @@ def config_from_mapping(payload: dict) -> PlatformConfig:
         interlock=_section(InterlockSection, payload.get("interlock")),
         quota=_section(QuotaSection, payload.get("quota")),
         audit=_section(AuditSection, payload.get("audit")),
+        clearing=_section(ClearingSection, payload.get("clearing")),
         console=_section(ConsoleSection, payload.get("console")),
     )
     return config.validate()

@@ -11,6 +11,13 @@
 from __future__ import annotations
 
 from .audit import AuditLog, build_timeline
+from .clearing import (
+    GO,
+    ChainBroken,
+    ClearingJournal,
+    ClearingService,
+)
+from .clearing.visits import VisitRegistry
 from .clock import Clock, SystemClock
 from .config import PlatformConfig, default_config, with_storage_root
 from .door import (
@@ -20,6 +27,7 @@ from .door import (
     close_and_audit,
     depart,
     depart_policy,
+    departed as door_departed,
     door_report,
     door_state,
     enqueue,
@@ -134,6 +142,18 @@ class Platform:
         )
         self.doors.set_batch_limit(self.config.door.batch_limit)
 
+        # 清客确认：哈希链只追加流水落在同一存储根目录，门区清单取自站台布局。
+        self.clearing_journal = ClearingJournal(
+            store.root, segment_limit=self.config.audit.journal_segment
+        )
+        self.visits = VisitRegistry(store)
+        self.clearing = ClearingService(
+            self.clearing_journal,
+            self.clock,
+            confirm_ttl_s=self.config.clearing.confirm_ttl_s,
+            timeout_policy=self.config.clearing.timeout_policy,
+        )
+
         self._cycles = 0
         self._operations = 0
         self._event_counts: dict[str, int] = {}
@@ -189,6 +209,7 @@ class Platform:
                 for index, group in enumerate(groups, start=1)
             ]
             self.layouts.save(Layout(station_id=station_id, zones=zones))
+            self.clearing.set_station_zones(station_id, [zone.id for zone in zones])
             self.mappings.renumber(station_id, {group: group for group in groups})
             self.schedules.save(
                 Schedule(station_id=station_id, headways=[120, 150, 180, 240])
@@ -219,6 +240,13 @@ class Platform:
         if isinstance(state, dict):
             self._operations = int(state.get("operations", 0))
             self._cycles = int(state.get("cycles", 0))
+        # 门区清单以布局为准（首次 seed 与历史存储都覆盖到）。
+        for station_id in self.namespace.station_ids():
+            layout = self.layouts.get(station_id)
+            if layout is not None:
+                self.clearing.set_station_zones(station_id, [zone.id for zone in layout.zones])
+        # 清客会话从哈希链全量重建并校验完整性；链损坏直接拒绝启动。
+        self.clearing.restore()
         restore_lockouts(self.faults, self.gates, self.lockouts, not self.gaps.blocked_ids())
 
     def _persist(self) -> None:
@@ -409,11 +437,48 @@ class Platform:
         except RailError as error:
             return reject(error.message)
         entry = self.audit.record(ARRIVAL, train_id, station_id, position_m=position_m)
+
+        # 开门即开始本次停靠的清客确认会话。重复到站（重连重放/双击）必须幂等：
+        # 若该列车已有进行中、且就在本站的会话，直接复用它，停靠计数不多加。
+        active_id = self.clearing._active.get(train_id)  # noqa: SLF001
+        clearing_reused = active_id is not None
+        if active_id is not None:
+            active_session = self.clearing.snapshot(active_id)
+            if active_session["station_id"] == station_id:
+                visit = active_session["visit"]
+                clearing = active_session
+            else:
+                raise RailError(
+                    f"列车 {train_id} 在 {active_session['station_id']} 的清客尚未闭环，"
+                    "不能在本站重新到站",
+                    component="clearing",
+                )
+        else:
+            visit = self.visits.current(train_id) + 1
+            clearing = self.clearing.start_session(
+                train_id,
+                station_id,
+                visit,
+                request_id=f"arrival:{train_id}:{station_id}:{visit}",
+            )
+            self.visits.increment(train_id)
+        if not clearing_reused:
+            self.audit.record(
+                "clearing_start",
+                train_id,
+                station_id,
+                visit=visit,
+                session_id=clearing["session_id"],
+                zones=len(clearing["zones"]),
+                timeout_policy=clearing["timeout_policy"],
+            )
         report = {
             "ok": True,
             "train_id": train_id,
             "station_id": station_id,
             "position_m": alignment.position_m,
+            "visit": visit,
+            "clearing_session": clearing["session_id"],
             "steps": steps,
             "violations": [],
         }
@@ -465,6 +530,38 @@ class Platform:
             steps.append(
                 {"component": "interlock", "action": "lock", "detail": {"psd_id": gate.id}}
             )
+
+        # 清客确认是发车链的第一道闸：门控、联锁、信号读到的必须是同一份结论。
+        # verdict 只读清客服务哈希链折叠出的唯一对象，本方法不自行再算一遍。
+        clearing = self.clearing.verdict(train_id)
+        if not clearing.allowed:
+            self.audit.record(
+                "clearing_depart_held",
+                train_id,
+                station_id,
+                session_id=clearing.session_id,
+                reasons=list(clearing.reasons),
+                missing=clearing.missing,
+                digest=clearing.digest,
+                ok=False,
+            )
+            report = {
+                "ok": False,
+                "train_id": train_id,
+                "station_id": station_id,
+                "steps": steps,
+                "violations": [f"清客确认未放行: {','.join(clearing.reasons)}"],
+                "clearing": clearing.as_dict(),
+            }
+            summary = self._record_operation(op_id, "depart", report)
+            return {**report, **summary}
+        steps.append(
+            {
+                "component": "clearing",
+                "action": "verdict_go",
+                "detail": {"session_id": clearing.session_id, "digest": clearing.digest},
+            }
+        )
         try:
             closed = close_and_audit(
                 self.doors, self.audit, train_id, station_id, DEPART, self.clock.now()
@@ -505,22 +602,84 @@ class Platform:
             {"component": "sig", "action": "depart_signal", "detail": {"train_id": train_id}}
         )
         departure = depart(self.doors, train_id, self.clock.now())
+
+        # 门控已落盘"已发车"，再把清客结论登记为已消费（哈希链闭环，防重复发车）。
+        # 若在此窗口结论被改动（极端竞争），登记会被拒，前面的门控动作按失败补偿。
+        dispatched = self.clearing.mark_dispatched(
+            train_id, request_id=f"depart:{op_id}"
+        )
+        steps.append(
+            {
+                "component": "clearing",
+                "action": "clearance_consumed",
+                "detail": {"session_id": clearing.session_id, "digest": clearing.digest},
+            }
+        )
         if gate is not None:
             self.lockouts.clear(gate.id)
+
+        # 三处事实对账：门控（已发车落盘）、联锁/清客（同一 session+digest+GO 已
+        # 闭环）、审计（本操作流水）。不一致就不能当成一次干净发车。
+        reconciled, reconcile_reasons = self._reconcile_clearing(
+            train_id, station_id, clearing.session_id, clearing.digest
+        )
+        self.audit.record(
+            "clearing_dispatch",
+            train_id,
+            station_id,
+            session_id=clearing.session_id,
+            visit=clearing.visit,
+            digest=clearing.digest,
+            version=dispatched["version"],
+            reconciled=reconciled,
+            ok=reconciled,
+        )
         report = {
-            "ok": True,
+            "ok": reconciled,
             "train_id": train_id,
             "station_id": station_id,
             "close_durable": bool(closed["close_durable"]),
             "aspect": verdict["aspect"],
             "cleared_commands": departure["cleared_commands"],
+            "clearing": {
+                "session_id": clearing.session_id,
+                "visit": clearing.visit,
+                "digest": clearing.digest,
+                "version": dispatched["version"],
+                "stage": dispatched["stage"],
+            },
+            "reconciled": reconciled,
             "steps": steps,
-            "violations": [],
+            "violations": list(reconcile_reasons),
         }
         summary = self._record_operation(op_id, "depart", report)
         self._operations += 1
         self._persist()
         return {**report, **summary}
+
+    def _reconcile_clearing(
+        self, train_id: str, station_id: str, session_id: str, digest: str
+    ) -> tuple[bool, list[str]]:
+        """门控、联锁/清客、审计三处对账，不一致逐条列出原因。"""
+
+        reasons: list[str] = []
+        # 门控事实：已发车且关门落盘。
+        if not door_departed(self.doors, train_id):
+            reasons.append("door_not_departed")
+        # 联锁侧读清客服务的同一个结论：必须已闭环且摘要未变。
+        post = self.clearing.verdict_for_session(session_id)
+        if post.stage != "dispatched":
+            reasons.append("clearance_not_consumed")
+        if post.digest != digest:
+            reasons.append("clearance_digest_changed")
+        # 审计事实：本次操作确实有对应清客流水（哈希链完整）。
+        try:
+            checked = self.clearing_journal.verify_chain(session_id)
+            if not checked.get("ok"):
+                reasons.append("clearance_chain_broken")
+        except ChainBroken:
+            reasons.append("clearance_chain_broken")
+        return not reasons, reasons
 
     def check_gap(self, train_id: str, clear: bool = True) -> dict:
         """确认间隙无异常，或登记一次可疑探测结果。"""
@@ -531,6 +690,133 @@ class Platform:
             result = self.gaps.probe(train_id, False, self.clock.now())
         self.audit.record("gap_probe", train_id, "", clear=clear)
         return {"ok": True, "train_id": train_id, "clear": result.clear, "violations": []}
+
+    # ---- 清客确认 -----------------------------------------------------
+
+    def clearing_session(self, train_id: str) -> dict:
+        """返回列车当前清客会话快照（掉线重连后凭它对齐进度）。"""
+
+        session_id = self.clearing.active_session_id(train_id)
+        return self.clearing.snapshot(session_id)
+
+    def clearing_verdict(self, train_id: str) -> dict:
+        """只读返回清客发车结论；门控、联锁、发车都以它为准。"""
+
+        return self.clearing.verdict(train_id).as_dict()
+
+    def confirm_zone(
+        self,
+        train_id: str,
+        zone_id: str,
+        request_id: str,
+        *,
+        confirmed_by: str = "staff",
+        expected_epoch: int | None = None,
+    ) -> dict:
+        """确认单个门区清客完毕（可任意顺序、并发确认不同门区）。"""
+
+        result = self.clearing.confirm_zone(
+            train_id,
+            zone_id,
+            confirmed_by=confirmed_by,
+            request_id=request_id,
+            expected_epoch=expected_epoch,
+        )
+        if not result.get("replayed"):
+            self.audit.record(
+                "clearing_confirm",
+                train_id,
+                result["station_id"],
+                session_id=result["session_id"],
+                zone_id=zone_id,
+                epoch=result["epoch"],
+                confirmed_by=confirmed_by,
+                request_id=request_id,
+            )
+        return result
+
+    def report_intrusion(
+        self,
+        train_id: str,
+        request_id: str,
+        *,
+        zone_ids: list[str] | None = None,
+        reason: str = "intrusion",
+    ) -> dict:
+        """登记有人闯回站台：相关门区确认失效、会话重新挂起。"""
+
+        result = self.clearing.report_intrusion(
+            train_id, zone_ids=zone_ids, reason=reason, request_id=request_id
+        )
+        if not result.get("replayed"):
+            self.audit.record(
+                "clearing_intrusion",
+                train_id,
+                result["station_id"],
+                session_id=result["session_id"],
+                zone_ids=list(zone_ids or []),
+                reason=reason,
+                suspended=True,
+                request_id=request_id,
+            )
+        return result
+
+    def resolve_intrusion(self, train_id: str, request_id: str) -> dict:
+        """现场处置完毕，解除挂起（门区仍需重新确认、重新收口）。"""
+
+        before = self.clearing_session(train_id)
+        result = self.clearing.resolve_intrusion(train_id, request_id=request_id)
+        if not result.get("replayed") and before.get("suspended"):
+            self.audit.record(
+                "clearing_intrusion_resolved",
+                train_id,
+                result["station_id"],
+                session_id=result["session_id"],
+                request_id=request_id,
+            )
+        return result
+
+    def finalize_clearing(
+        self,
+        train_id: str,
+        request_id: str,
+        *,
+        confirmed_by: str = "dispatcher",
+        expected_digest: str = "",
+    ) -> dict:
+        """统一收口：全部门区当前且未过期、无挂起时冻结发车结论。"""
+
+        result = self.clearing.finalize(
+            train_id,
+            confirmed_by=confirmed_by,
+            request_id=request_id,
+            expected_digest=expected_digest,
+        )
+        if not result.get("replayed"):
+            self.audit.record(
+                "clearing_finalize",
+                train_id,
+                result["station_id"],
+                session_id=result["session_id"],
+                digest=result["finalize_digest"],
+                epoch=result["epoch"],
+                zones=len(result["zones"]),
+                request_id=request_id,
+            )
+        return result
+
+    def clearing_events(self, train_id: str) -> list[dict]:
+        """返回会话全部事实事件（历史不可变，供巡检/审计回放）。"""
+
+        session_id = self.clearing.active_session_id(train_id)
+        return self.clearing.events(session_id)
+
+    def verify_clearing(self, train_id: str) -> dict:
+        """校验会话哈希链完整性。"""
+
+        session_id = self.clearing.active_session_id(train_id)
+        return self.clearing.verify(session_id)
+
 
     def renumber(self, station_id: str, groups: dict[str, str]) -> dict:
         """按最新布局重排门区映射，并按新映射联动一次。"""
@@ -746,6 +1032,12 @@ class Platform:
                 ARRIVAL: self.quotas.status(ARRIVAL),
                 DEPART: self.quotas.status(DEPART),
             },
+            "clearing": {
+                "sessions": self.clearing.list_sessions(),
+                "active": dict(self._clearing_active()),
+                "confirm_ttl_s": self.clearing.ttl_s,
+                "timeout_policy": self.config.clearing.timeout_policy,
+            },
             "store": self.metrics.summary(),
             "audit": self.audit.summary(),
             "trend": self.trend.snapshot(limit=4),
@@ -785,6 +1077,7 @@ class Platform:
             "doors": door_state(self.doors, train_id),
             "aspect": aspect_of(self.signals, train_id),
             "gap": self.gaps.state(train_id),
+            "clearing": self.clearing.snapshot_for_train(train_id),
         }
 
     def station_view(self, station_id: str) -> dict:
@@ -862,6 +1155,30 @@ class Platform:
 
         gates = self.gates.by_station(station_id)
         return gates[0] if gates else None
+
+    def _clearing_active(self) -> list[tuple[str, dict]]:
+        """返回全部进行中清客会话的 (列车, 结论摘要)。"""
+
+        result = []
+        for train in self.trains.list():
+            snapshot = self.clearing.snapshot_for_train(train.id)
+            if snapshot is not None:
+                result.append(
+                    (
+                        train.id,
+                        {
+                            "session_id": snapshot["session_id"],
+                            "stage": snapshot["stage"],
+                            "suspended": snapshot["suspended"],
+                            "epoch": snapshot["epoch"],
+                            "decision": snapshot["verdict"]["decision"],
+                            "confirmed_current": snapshot["confirmed_current"],
+                            "missing": snapshot["missing"],
+                            "digest": snapshot["digest"],
+                        },
+                    )
+                )
+        return result
 
     def _adjacent_sample(self) -> dict:
         """给快照提供一个相邻关系样例。"""

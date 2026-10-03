@@ -34,3 +34,14 @@ def online(platform) -> Platform:
     platform.arrive("T01", "ST1", 0)
     platform.check_gap("T01")
     return platform
+
+
+def clear_passengers(platform, train_id: str, suffix: str = "") -> None:
+    """逐门区确认并收口清客（发车站台前置条件）。"""
+
+    snapshot = platform.clearing_session(train_id)
+    for zone_id in snapshot["zone_order"]:
+        platform.confirm_zone(
+            train_id, zone_id, f"clear-{train_id}-{zone_id}{suffix}"
+        )
+    platform.finalize_clearing(train_id, request_id=f"finalize-{train_id}{suffix}")

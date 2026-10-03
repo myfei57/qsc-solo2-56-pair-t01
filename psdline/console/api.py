@@ -91,6 +91,14 @@ class Api:
         add("POST", "/api/dwell", self._dwell)
         add("POST", "/api/route", self._route)
         add("POST", "/api/reset-state", self._reset_state)
+        add("GET", "/api/clearing/{trainID}", self._clearing_session)
+        add("GET", "/api/clearing/{trainID}/verdict", self._clearing_verdict)
+        add("GET", "/api/clearing/{trainID}/events", self._clearing_events)
+        add("POST", "/api/clearing/{trainID}/confirm", self._clearing_confirm)
+        add("POST", "/api/clearing/{trainID}/intrude", self._clearing_intrude)
+        add("POST", "/api/clearing/{trainID}/resolve", self._clearing_resolve)
+        add("POST", "/api/clearing/{trainID}/finalize", self._clearing_finalize)
+        add("POST", "/api/clearing/{trainID}/verify", self._clearing_verify)
 
     def routes(self) -> list[dict]:
         """返回接口清单，供自检与文档核对。"""
@@ -264,3 +272,54 @@ class Api:
 
     def _reset_state(self, params: dict, body: dict) -> dict:
         return {"removed": self._platform.reset_state()}
+
+    # ---- 清客确认 -----------------------------------------------------
+
+    def _clearing_session(self, params: dict, body: dict) -> dict:
+        return self._platform.clearing_session(str(params.get("trainID", "")))
+
+    def _clearing_verdict(self, params: dict, body: dict) -> dict:
+        return self._platform.clearing_verdict(str(params.get("trainID", "")))
+
+    def _clearing_events(self, params: dict, body: dict) -> dict:
+        train_id = str(params.get("trainID", ""))
+        return {"events": self._platform.clearing_events(train_id)}
+
+    def _clearing_confirm(self, params: dict, body: dict) -> dict:
+        train_id = str(params.get("trainID", ""))
+        epoch = body.get("expected_epoch")
+        return self._platform.confirm_zone(
+            train_id,
+            _require(body, "zone_id"),
+            _require(body, "request_id"),
+            confirmed_by=str(body.get("confirmed_by", "staff")),
+            expected_epoch=int(epoch) if epoch is not None else None,
+        )
+
+    def _clearing_intrude(self, params: dict, body: dict) -> dict:
+        train_id = str(params.get("trainID", ""))
+        zone_ids = body.get("zone_ids")
+        if zone_ids is not None and not isinstance(zone_ids, list):
+            raise RailError("zone_ids 必须是数组", component="console")
+        return self._platform.report_intrusion(
+            train_id,
+            _require(body, "request_id"),
+            zone_ids=[str(z) for z in zone_ids] if zone_ids else None,
+            reason=str(body.get("reason", "intrusion")),
+        )
+
+    def _clearing_resolve(self, params: dict, body: dict) -> dict:
+        return self._platform.resolve_intrusion(
+            str(params.get("trainID", "")), _require(body, "request_id")
+        )
+
+    def _clearing_finalize(self, params: dict, body: dict) -> dict:
+        return self._platform.finalize_clearing(
+            str(params.get("trainID", "")),
+            _require(body, "request_id"),
+            confirmed_by=str(body.get("confirmed_by", "dispatcher")),
+            expected_digest=str(body.get("expected_digest", "")),
+        )
+
+    def _clearing_verify(self, params: dict, body: dict) -> dict:
+        return self._platform.verify_clearing(str(params.get("trainID", "")))

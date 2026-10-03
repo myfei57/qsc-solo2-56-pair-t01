@@ -11,7 +11,7 @@ from html import escape
 
 from ..app import Platform
 
-PAGE_PATHS: tuple[str, ...] = ("/", "/trains", "/doors", "/alarms")
+PAGE_PATHS: tuple[str, ...] = ("/", "/trains", "/doors", "/clearing", "/alarms")
 
 _STYLE = """
 body { font-family: ui-sans-serif, system-ui, sans-serif; margin: 0; background: #101820; color: #e8eef5; }
@@ -30,6 +30,7 @@ _NAV: tuple[tuple[str, str], ...] = (
     ("/", "站台"),
     ("/trains", "列车"),
     ("/doors", "门控"),
+    ("/clearing", "清客"),
     ("/alarms", "告警"),
 )
 
@@ -122,7 +123,76 @@ def _train_page(platform: Platform) -> str:
         ]
         or [("暂无", "-")],
     )
+    body += _table(
+        "清客确认",
+        [
+            (
+                item["train"]["id"],
+                (
+                    f"{cl['session_id']} 阶段 {cl['stage']} 代际 {cl['epoch']} "
+                    f"结论 <span class='{'ok' if cl['verdict']['decision'] == 'go' else 'alarm'}'>"
+                    f"{cl['verdict']['decision']}</span>"
+                    + (f" 挂起({cl['intrusion_reason']})" if cl["suspended"] else "")
+                    + (f" 待确认 {sorted(cl['missing'])}" if cl["missing"] else "")
+                )
+                if cl
+                else "-",
+            )
+            for item in views
+            for cl in [item.get("clearing")]
+        ]
+        or [("暂无", "-")],
+    )
     return _shell("列车控制台", body)
+
+
+def _clearing_page(platform: Platform) -> str:
+    """清客页：逐会话展示门区确认、挂起与发车结论。"""
+
+    status = platform.status()["clearing"]
+    body = _table(
+        "清客总览",
+        [
+            ("确认有效期 (s)", status["confirm_ttl_s"]),
+            ("超时策略", status["timeout_policy"]),
+            ("历史会话数", len(status["sessions"])),
+            ("进行中会话", len(status["active"])),
+        ],
+    )
+    active_rows = []
+    for train_id, item in sorted(status["active"].items()):
+        missing = ",".join(sorted(item["missing"])) or "-"
+        active_rows.append(
+            (
+                train_id,
+                f"{item['session_id']} 阶段 {item['stage']} 代际 {item['epoch']} "
+                f"结论 <span class='{'ok' if item['decision'] == 'go' else 'alarm'}'>"
+                f"{item['decision']}</span>"
+                + (" 挂起" if item["suspended"] else "")
+                + f" 已确认 {','.join(item['confirmed_current']) or '-'} 待确认 {missing}"
+                + f" 摘要 {item['digest'][:8]}",
+            )
+        )
+    body += _table("进行中清客会话", active_rows or [("暂无", "-")])
+    for train_id, item in sorted(status["active"].items()):
+        snapshot = platform.clearing_session(train_id)
+        body += _table(
+            f"{train_id} 门区明细（{snapshot['session_id']}）",
+            [
+                (
+                    zone["zone_id"],
+                    (
+                        f"{'已确认' if zone['current'] else '未确认'}"
+                        f"{'（过期）' if zone.get('reason') == 'confirm_expired' else ''}"
+                        f"{'（闯入失效）' if zone.get('reason') == 'intrusion' else ''}"
+                        f"{'（代际失效）' if zone.get('reason') == 'stale_epoch' else ''}"
+                        f" {zone['confirmed_by'] or ''} @{zone['confirm_at'] or ''}"
+                    ),
+                )
+                for zone in snapshot["zones"]
+            ],
+        )
+    return _shell("清客确认控制台", body)
 
 
 def _door_page(platform: Platform) -> str:
@@ -200,6 +270,7 @@ _RENDERERS = {
     "/": _station_page,
     "/trains": _train_page,
     "/doors": _door_page,
+    "/clearing": _clearing_page,
     "/alarms": _alarm_page,
 }
 

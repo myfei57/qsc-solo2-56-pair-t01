@@ -25,7 +25,7 @@ from .config import config_to_mapping, default_config, load_config
 from .console.server import ConsoleServer, probe_endpoints
 from .errors import RailError
 
-DEFAULT_PROBE_PATHS = ("/api/status", "/api/readiness", "/api/stations", "/", "/alarms")
+DEFAULT_PROBE_PATHS = ("/api/status", "/api/readiness", "/api/stations", "/", "/clearing", "/alarms")
 
 
 def _build(args: argparse.Namespace) -> Platform:
@@ -73,6 +73,15 @@ def _cmd_demo(args: argparse.Namespace) -> int:
     arrival = platform.arrive(args.train, args.station, 0)
     position = platform.refresh_position(args.train, 12)
     gap = platform.check_gap(args.train)
+
+    # 清客确认：到站后按门区逐块确认，最后统一收口；没收口发车会被挡下。
+    clearing_session = platform.clearing_session(args.train)
+    for index, zone_id in enumerate(clearing_session["zone_order"]):
+        platform.confirm_zone(
+            args.train, zone_id, f"clear-{args.station}-{zone_id}", confirmed_by=f"staff-{index}"
+        )
+    clearing_final = platform.finalize_clearing(args.train, request_id=f"finalize-{args.station}")
+
     queued = platform.enqueue(args.train, "cmd-1", "open", args.station)
     processed = platform.process_queue(args.train)
     swept = platform.sweep(args.station)
@@ -99,6 +108,13 @@ def _cmd_demo(args: argparse.Namespace) -> int:
         "arrival": {key: arrival[key] for key in ("ok", "position_m", "violations")},
         "position": position,
         "gap": gap,
+        "clearing": {
+            "session": clearing_session["session_id"],
+            "zones": len(clearing_session["zones"]),
+            "finalized": clearing_final["stage"],
+            "decision": clearing_final["verdict"]["decision"],
+            "digest": clearing_final["finalize_digest"],
+        },
         "queued": {key: queued[key] for key in ("ok", "train_id")},
         "processed": processed,
         "swept": swept,
@@ -129,6 +145,8 @@ def _cmd_demo(args: argparse.Namespace) -> int:
     ):
         if not operation.get("ok"):
             failures.extend(f"{name}:{item}" for item in operation.get("violations", []))
+    if clearing_final["verdict"]["decision"] != "go":
+        failures.append("clearing:finalize-not-go")
     if failures:
         print(f"检查未通过: {failures}", file=sys.stderr)
         return 1
@@ -158,6 +176,112 @@ def _next_station(platform: Platform, station_id: str) -> str:
         return station_id
     index = stations.index(station_id) if station_id in stations else 0
     return stations[(index + 1) % len(stations)]
+
+
+def _cmd_clear_demo(args: argparse.Namespace) -> int:
+    """清客确认专项演示：正常收口、闯回挂起、超时与幂等重放。"""
+
+    import threading
+
+    clock = ManualClock()
+    storage_root = getattr(args, "storage_root", None) or tempfile.mkdtemp(prefix="psdline-clear-")
+    config = load_config(args.config) if getattr(args, "config", None) else default_config()
+    from dataclasses import replace
+
+    from .config import ClearingSection
+
+    config = replace(
+        config,
+        clearing=ClearingSection(confirm_ttl_s=args.ttl, timeout_policy=args.policy),
+    )
+    platform = build_platform(config, clock=clock, storage_root=storage_root)
+    platform.start()
+    log: list[dict] = []
+
+    def step(name: str, payload: object) -> None:
+        log.append({"step": name, "payload": payload})
+        print(f"[{name}] {json.dumps(payload, ensure_ascii=False, default=str)}")
+
+    step("startup", platform.start())
+    step("arrive", _keep(platform.arrive(args.train, args.station, 0),
+                         ("ok", "visit", "clearing_session")))
+    platform.check_gap(args.train)
+
+    # 1) 没收口：发车被挡
+    held = platform.depart(args.train, args.station)
+    step("depart_held_before_finalize",
+         {"ok": held["ok"], "violations": held["violations"],
+          "decision": held["clearing"]["decision"]})
+
+    # 2) 站务并发（多线程）逐块确认
+    snapshot = platform.clearing_session(args.train)
+    errors: list[str] = []
+
+    def confirm(zone: str, worker: int) -> None:
+        try:
+            platform.confirm_zone(args.train, zone, f"demo-{zone}", confirmed_by=f"staff-{worker}")
+        except RailError as error:
+            errors.append(error.message)
+
+    threads = [
+        threading.Thread(target=confirm, args=(zone, index))
+        for index, zone in enumerate(snapshot["zone_order"])
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    step("concurrent_confirm", {"zones": snapshot["zone_order"], "errors": errors})
+
+    # 3) 断线重连：同一批 request_id 原样重发，全部幂等
+    replayed = [
+        platform.confirm_zone(args.train, zone, f"demo-{zone}")["replayed"]
+        for zone in snapshot["zone_order"]
+    ]
+    step("reconnect_replay", {"all_replayed": all(replayed), "detail": replayed})
+
+    # 4) 收口
+    finalized = platform.finalize_clearing(args.train, request_id="demo-finalize")
+    step("finalize", {"stage": finalized["stage"], "decision": finalized["verdict"]["decision"],
+                      "digest": finalized["finalize_digest"]})
+
+    # 5) 收口后有人闯回 G02：结论立即作废、发车被挡
+    intrusion = platform.report_intrusion(args.train, "demo-intrusion", zone_ids=["G02"])
+    step("intrusion", {"suspended": intrusion["suspended"],
+                       "decision": intrusion["verdict"]["decision"],
+                       "missing": intrusion["missing"]})
+    held2 = platform.depart(args.train, args.station)
+    step("depart_held_after_intrusion", {"ok": held2["ok"], "violations": held2["violations"]})
+
+    # 6) 处置：解除挂起 → 重确认 G02 → 重新收口
+    platform.resolve_intrusion(args.train, "demo-resolve")
+    platform.confirm_zone(args.train, "G02", "demo-G02-recheck")
+    finalized2 = platform.finalize_clearing(args.train, request_id="demo-finalize-2")
+    step("recover", {"decision": finalized2["verdict"]["decision"],
+                     "stage": finalized2["stage"]})
+
+    # 7) 发车：三处对账
+    departure = platform.depart(args.train, args.station)
+    step("depart", {"ok": departure["ok"], "reconciled": departure.get("reconciled"),
+                    "clearing": departure.get("clearing"), "violations": departure["violations"]})
+
+    # 8) 哈希链校验
+    step("verify_chain", platform.verify_clearing(args.train))
+
+    # 9) 重启重建，结论一致
+    rebuilt = build_platform(config, clock=clock, storage_root=storage_root)
+    verdict = rebuilt.clearing_verdict(args.train)
+    step("restart_verdict", {"stage": verdict["stage"], "decision": verdict["decision"],
+                             "reasons": list(verdict["reasons"])})
+
+    ok = (not held["ok"]) and all(replayed) and (not held2["ok"]) and departure["ok"] \
+        and departure.get("reconciled") and verdict["stage"] == "dispatched"
+    print(json.dumps({"ok": ok, "storage_root": storage_root}, ensure_ascii=False))
+    return 0 if ok else 1
+
+
+def _keep(payload: dict, keys: tuple[str, ...]) -> dict:
+    return {key: payload.get(key) for key in keys}
 
 
 def _cmd_status(args: argparse.Namespace) -> int:
@@ -207,6 +331,14 @@ def build_parser() -> argparse.ArgumentParser:
     demo.add_argument("--dt", type=float, default=1.0, help="控制周期步长（秒）")
     demo.add_argument("--fast", action="store_true", help="使用可推进时钟，跳过真实等待")
     demo.set_defaults(func=_cmd_demo)
+
+    clear_demo = sub.add_parser("clear-demo", help="跑一遍清客确认专项流程", parents=[common])
+    clear_demo.add_argument("--train", default="T01", help="演示用的列车标识")
+    clear_demo.add_argument("--station", default="ST1", help="演示用的站台标识")
+    clear_demo.add_argument("--ttl", type=float, default=120.0, help="确认有效期（秒）")
+    clear_demo.add_argument("--policy", choices=("preserve", "reset"), default="preserve",
+                            help="确认超时策略")
+    clear_demo.set_defaults(func=_cmd_clear_demo)
 
     status = sub.add_parser("status", help="打印状态快照", parents=[common])
     status.set_defaults(func=_cmd_status)

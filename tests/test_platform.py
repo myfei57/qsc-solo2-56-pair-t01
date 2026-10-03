@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from conftest import clear_passengers
 from psdline.errors import RailError
 from psdline.door import departed
 
@@ -22,6 +23,7 @@ def test_arrive_then_depart_full_chain(platform):
     assert platform.train_doors.is_open("T01") is True
     gap = platform.check_gap("T01")
     assert gap["ok"] is True
+    clear_passengers(platform, "T01")
     departure = platform.depart("T01", "ST1")
     assert departure["ok"] is True
     assert departure["close_durable"] is True
@@ -40,6 +42,8 @@ def test_arrive_rejects_out_of_tolerance_and_unknown_station(platform):
 
 def test_depart_blocked_by_blocked_gap(platform):
     platform.arrive("T01", "ST1", 0)
+    # 清客先收口，才能越过清客闸门、真正走到间隙探测检查
+    clear_passengers(platform, "T01")
     platform.check_gap("T01", clear=False)
     departure = platform.depart("T01", "ST1")
     assert departure["ok"] is False
@@ -110,6 +114,7 @@ def test_process_queue_requires_depart_policy(platform):
     assert blocked["ready"] is False
     assert "close_durable" in blocked["violations"]
     platform.check_gap("T01")
+    clear_passengers(platform, "T01")
     platform.depart("T01", "ST1")
     allowed = platform.process_queue("T01")
     assert allowed["ready"] is True

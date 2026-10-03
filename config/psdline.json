@@ -6,7 +6,11 @@
   },
   "namespace": {
     "line": "L1",
-    "stations": ["ST1", "ST2", "ST3"]
+    "stations": [
+      "ST1",
+      "ST2",
+      "ST3"
+    ]
   },
   "station": {
     "groups_per_station": 4,
@@ -50,5 +54,9 @@
   "console": {
     "host": "127.0.0.1",
     "port": 8080
+  },
+  "clearing": {
+    "confirm_ttl_s": 120.0,
+    "timeout_policy": "preserve"
   }
 }
